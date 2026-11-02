@@ -7,7 +7,7 @@
 When you stop touching the mouse and keyboard, a fuse appears across the screen and starts to burn. Seventy-five seconds, the length of a Hearthstone turn. Touch anything and it is gone.
 
 ## 웹 (Web)
-`web/index.html`. 탭에서 5초 동안 아무것도 하지 않으면 탄다. `?t=10`으로 기다리는 시간을 바꾼다. 한 번 누르면 소리가 난다.
+`docs/index.html` (https://soft-coding-club.github.io/dont-burn-the-rope/). 탭에서 5초 동안 아무것도 하지 않으면 탄다. `?t=10`으로 기다리는 시간을 바꾼다. 한 번 누르면 소리가 난다.
 
 ## macOS
 `mac/`. 화면 전체 위에 투명하게 떠서, 컴퓨터 전체의 입력이 멈추면 탄다. 메뉴 막대의 불꽃 아이콘에서 기다리는 시간(3초~5분), 소리, 잠시 끄기를 고른다.
