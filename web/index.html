@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>밧줄을 태우지 마라</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="description" content="가만히 있으면 밧줄이 탄다.">
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:#0d0d0e;overflow:hidden;touch-action:none}
+canvas{position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;transition:opacity .35s ease-out}
+canvas.on{opacity:1;transition:opacity 1.2s ease-in}
+</style>
+<script src="assets/textures.js"></script>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+/* v3: physically-motivated fuse fire.
+   - the rope does not vanish at the flame: a charred remnant shrinks behind the burning front, glowing in its fibres
+   - a white-hot core sits inside the rope, with a small flickering flame tongue
+   - sparks are integrated particles (drag, gravity), drawn as motion-blurred streaks whose colour follows a
+     black-body cooling curve; some sparks burst into children, like real fuse/sparkler sparks
+   - thin smoke wisps rise and drift
+   - emissive light goes to a float buffer, then bloom (two blur levels) and a soft tone map            */
+const cv=document.getElementById('cv');
+const gl=cv.getContext('webgl2',{premultipliedAlpha:true,alpha:true,antialias:true,preserveDrawingBuffer:true});
+if(!gl||!window.ROPE_TEX)throw new Error('no webgl2');
+const HDR=!!gl.getExtension('EXT_color_buffer_float');
+const M=ROPE_TEX.meta;
+const S={turnStart:Date.now(),turnDur:75000,loop:true,sound:true,vis:false,fixed:null,smoke:true};
+let W=0,H=0,DPR=1,flash=0;
+const post=m=>{try{window.webkit.messageHandlers.rope.postMessage(m)}catch(e){}};
+window.ropeSetup=o=>{if('sound'in o){S.sound=!!o.sound;if(S.sound)audio()}if('smoke'in o)S.smoke=!!o.smoke};
+window.ropeTurn=(t,d,loop)=>{S.turnStart=t;S.turnDur=d||75000;S.loop=loop!==false;flash=1};
+window.ropeShow=()=>{S.turnStart=Date.now();S.loop=true;flash=1;cv.classList.add('on');S.vis=true;if(AC&&S.sound)AC.resume().catch(()=>{})};
+window.ropeHide=()=>{cv.classList.remove('on');S.vis=false};
+window.ropeFix=f=>{S.fixed=f;cv.classList.add('on');S.vis=true};   // test hook: freeze progress at fraction f
+window.ropeState=()=>JSON.stringify({frac:frac(),W,H,hdr:HDR,sparks:sparks.length});
+function frac(){if(S.fixed!=null)return S.fixed;let e=Date.now()-S.turnStart;if(e<0)e=0;
+  if(e>=S.turnDur){if(S.loop){const n=Math.floor(e/S.turnDur);S.turnStart+=n*S.turnDur;e-=n*S.turnDur;flash=1}else return 1}
+  return e/S.turnDur}
+function geo(){return{x0:W*0.1,x1:W*0.9,y:H*0.5,th:Math.max(6,H*0.0115)}}
+
+/* ---------------- GL ---------------- */
+const VS=`#version 300 es
+in vec2 aPos;in vec2 aUV;in vec4 aCol;uniform vec2 uRes;out vec2 vUV;out vec2 vPos;out vec4 vCol;
+void main(){vUV=aUV;vPos=aPos;vCol=aCol;vec2 c=aPos/uRes*2.0-1.0;gl_Position=vec4(c.x,-c.y,0.0,1.0);}`;
+const LIB=`float h1(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float n2(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);return mix(mix(h1(i),h1(i+vec2(1,0)),f.x),mix(h1(i+vec2(0,1)),h1(i+vec2(1,1)),f.x),f.y);}
+float fbm(vec2 p){float s=0.0,a=0.5;for(int i=0;i<5;i++){s+=a*n2(p);p=p*2.03+vec2(1.7,9.2);a*=0.5;}return s;}
+// black-body colour, t: 0 = dull red (~900K) .. 1 = white-hot (~3000K)
+vec3 bb(float t){t=clamp(t,0.0,1.0);return vec3(1.0,pow(clamp((t-0.08)*1.35,0.0,1.0),1.25)*0.92,pow(clamp((t-0.5)*2.0,0.0,1.0),1.4)*0.82);}`;
+const FS={
+rope:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;
+uniform sampler2D uAlb;uniform sampler2D uNrm;uniform float uTip,uTh,uTime,uMode,uBurn,uVC,uVH,uX0,uX1;
+${LIB}
+void main(){
+  float d=(vPos.x-uTip)/uTh;                       // >0 ahead (fresh rope), <0 behind (charred)
+  float y=(vUV.y-uVC)/uVH;                         // -1..1 across the rope body
+  float edge=(fbm(vec2(y*2.5,uTime*1.4))-0.5)*0.9; // ragged burning front
+  float de=d-edge;
+  const float CH=2.6;                              // length of the charred remnant, in rope widths
+  float t=clamp(-de/CH,0.0,1.0);
+  float jag=fbm(vec2(vPos.x/uTh*1.7,y*3.0+7.0));
+  float allowed=1.0-0.62*t-0.35*t*jag;             // remnant gets thinner and ragged toward the ash
+  float inside=1.0-smoothstep(allowed-0.18,allowed,abs(y));
+  float tail=1.0-smoothstep(0.62,1.0,t+0.25*(jag-0.5));
+  float mask=de>0.0?1.0:inside*tail;
+  if(uBurn<0.5)mask=1.0;
+  // rounded ends
+  float cap=sqrt(max(0.0,1.0-y*y))*0.5;
+  mask*=smoothstep(-0.1,0.2,(uX1-vPos.x)/uTh-0.5+cap)*smoothstep(-0.1,0.2,(vPos.x-uX0)/uTh-0.5+cap);
+  vec4 al=texture(uAlb,vUV,0.6);float a=al.a*mask;
+  vec3 base=al.a>0.001?al.rgb/al.a:vec3(0.0);
+  float lum=dot(base,vec3(0.299,0.587,0.114));
+  if(uMode>1.5){ // emissive: smouldering fibres + the burning front line
+    if(uBurn<0.5){o=vec4(0.0);return;}
+    float fib=smoothstep(0.25,0.75,lum);
+    float fl=fbm(vPos/uTh*1.6+vec2(0.0,-uTime*2.2))*0.75+fbm(vPos/uTh*4.0+vec2(uTime*3.1,0.0))*0.25;
+    float zone=smoothstep(-CH*0.55,-0.1,de)*(1.0-smoothstep(0.0,0.4,de));
+    float spots=smoothstep(0.58,0.8,fbm(vPos/uTh*2.6+vec2(uTime*0.4,-uTime*0.9)));
+    float crack=smoothstep(0.6,0.9,fl*0.75+fib*0.4)*0.6+spots*0.8;
+    vec3 e=bb(0.12+0.28*fl*zone)*zone*crack*1.2;
+    float front=exp(-pow((de+0.05)/0.28,2.0))*(0.55+0.45*fl)*(1.0-abs(y)*0.35);
+    e+=bb(0.6+0.25*fl)*front*2.6;
+    e+=bb(0.3)*exp(-max(de,0.0)/0.7)*step(0.0,de)*(0.35+0.25*fl)*(0.4+0.6*lum);  // fresh fibres reddening ahead of the front
+    o=vec4(e*a,0.0);return;}
+  if(uMode>0.5){float sa=a*0.45*smoothstep(-0.2,0.6,de);o=vec4(0.0,0.0,0.0,sa);return;}  // contact shadow (not under the char)
+  vec3 nm=normalize(texture(uNrm,vUV,1.4).xyz*2.0-1.0);
+  vec3 L=normalize(vec3(-0.3,-0.65,0.7));
+  float diff=clamp(dot(nm,L),0.0,1.0);
+  float spec=pow(clamp(dot(reflect(-L,nm),vec3(0,0,1)),0.0,1.0),14.0);
+  vec3 b2=mix(base,vec3(lum),0.28)*vec3(1.13,1.02,0.68)+0.04;
+  vec3 col=b2*(0.62+0.48*diff)+vec3(1.0,0.95,0.82)*spec*0.06;
+  // heat browning just ahead of the front
+  col*=mix(vec3(0.55,0.36,0.2),vec3(1.0),smoothstep(0.0,1.8,de));
+  // char: black, dry, slightly grey on the fibre tops
+  float ch=1.0-smoothstep(-0.15,0.55,de);
+  vec3 charc=vec3(0.06,0.05,0.045)+vec3(0.13,0.12,0.11)*smoothstep(0.55,0.9,lum)*t;
+  col=mix(col,charc,ch);
+  o=vec4(col*a,a);}`,
+ash:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;uniform float uTip,uTh,uStart;
+${LIB}
+void main(){float d=(uTip-vPos.x)/uTh;float y=(vUV.y-0.5)*2.0;
+  y+=(fbm(vec2(vPos.x/uTh*0.12,2.0))-0.5)*0.5;
+  float wid=0.45+0.45*n2(vec2(vPos.x/uTh*0.4,5.0));
+  float line=exp(-y*y*10.0/(wid*wid));
+  float seg=0.2+0.8*smoothstep(0.3,0.65,fbm(vec2(vPos.x/uTh*0.6,3.0)));
+  float grain=0.6+0.4*fbm(vPos/uTh*2.5);
+  float a=line*seg*grain*smoothstep(2.0,3.4,d)*0.5;
+  o=vec4(vec3(0.42,0.40,0.37)*a,a);}`,
+smoke:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;uniform float uTime,uTh;
+${LIB}
+void main(){float y=vUV.y;float nz=fbm(vPos/uTh*0.55+vec2(0.0,uTime*0.6));
+  float a=exp(-y*y*2.2)*(0.35+0.9*nz*nz)*vCol.a;
+  vec3 c=mix(vec3(0.60,0.64,0.71),vec3(0.95,0.62,0.36),vCol.r*0.7);   // blue-grey smoke, lit warm right above the flame
+  o=vec4(c*a,a);}`,
+core:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;uniform float uTime,uI;
+${LIB}
+void main(){vec2 q=vUV*5.0; // rope widths, y down
+  float fl=fbm(vec2(uTime*7.0,1.3))*0.7+0.3*h1(vec2(floor(uTime*40.0),2.0));
+  float core=exp(-(q.x*q.x/0.15+q.y*q.y/0.07))*(0.7+0.6*fl);
+  float hot=exp(-(q.x*q.x/0.9+q.y*q.y/0.35));
+  // small flame tongue leaning back, licking upward
+  vec2 f=q-vec2(-0.1,0.05);float up=clamp(-f.y/1.1,0.0,1.0);
+  float sway=(fbm(vec2(up*2.0-uTime*5.0,uTime*1.3))-0.5)*0.5*up;
+  float w=0.28*(1.0-up*0.85);
+  float tongue=exp(-pow(f.x-sway+up*0.2,2.0)/(w*w))*smoothstep(0.3,-0.1,f.y)*(1.0-up)*(0.55+0.45*fbm(vec2(f.x*4.0,f.y*3.0+uTime*11.0)));
+  vec3 e=bb(0.97)*core*4.2+bb(0.5)*hot*1.0+bb(0.42+0.2*(1.0-up))*tongue*0.55;
+  float r=length(q);e+=bb(0.36)*exp(-r*r/4.0)*0.45;
+  e*=1.0-smoothstep(3.6,5.0,r);
+  o=vec4(e*uI,0.0);}`,
+spark:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;
+${LIB}
+void main(){float x=vUV.x,y=vUV.y;            // x: 0 tail .. 1 head, y: -1..1 across
+  float across=exp(-y*y*4.0);
+  float along=smoothstep(0.0,0.6,x)*(0.35+0.65*x)*(1.0-smoothstep(0.96,1.0,x)*0.4);
+  float head=exp(-pow((x-0.95)*7.0,2.0)-y*y*3.0)*0.8;
+  o=vec4(vCol.rgb*(across*along+head),0.0);}`,
+blit:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;uniform sampler2D uT;uniform vec2 uTR;
+void main(){vec2 uv=gl_FragCoord.xy/uTR;o=texture(uT,uv);}`,
+blur:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;uniform sampler2D uT;uniform vec2 uTR,uDir;
+void main(){vec2 uv=gl_FragCoord.xy/uTR;vec4 s=texture(uT,uv)*0.2270270270;
+  s+=(texture(uT,uv+uDir*1.3846153846)+texture(uT,uv-uDir*1.3846153846))*0.3162162162;
+  s+=(texture(uT,uv+uDir*3.2307692308)+texture(uT,uv-uDir*3.2307692308))*0.0702702703;o=s;}`,
+comp:`#version 300 es
+precision highp float;in vec2 vUV;in vec2 vPos;in vec4 vCol;out vec4 o;uniform sampler2D uE,uB1,uB2;uniform vec2 uTR;uniform float uScale;
+void main(){vec2 uv=gl_FragCoord.xy/uTR;
+  vec3 c=texture(uE,uv).rgb*uScale+texture(uB1,uv).rgb*uScale*0.4+texture(uB2,uv).rgb*uScale*0.45;
+  c=1.0-exp(-c*1.1);                       // soft tone map
+  // browsers clamp colour to alpha on a transparent canvas, so light must carry coverage = its brightness
+  o=vec4(c,max(c.r,max(c.g,c.b)));}`,
+};
+function sh(t,src){const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s}
+const P={};
+for(const k in FS){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,VS));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,FS[k]));
+  gl.bindAttribLocation(p,0,'aPos');gl.bindAttribLocation(p,1,'aUV');gl.bindAttribLocation(p,2,'aCol');gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(k+': '+gl.getProgramInfoLog(p));
+  const u={};const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);for(let i=0;i<n;i++){const nm=gl.getActiveUniform(p,i).name;u[nm]=gl.getUniformLocation(p,nm)}P[k]={p,u}}
+const vao=gl.createVertexArray();gl.bindVertexArray(vao);const vbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,32,0);
+gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,2,gl.FLOAT,false,32,8);
+gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,4,gl.FLOAT,false,32,16);
+let buf=new Float32Array(8*6*1024),nv=0;
+function vtx(x,y,u,v,c){if((nv+1)*8>buf.length){const b=new Float32Array(buf.length*2);b.set(buf);buf=b}const o=nv*8;buf[o]=x;buf[o+1]=y;buf[o+2]=u;buf[o+3]=v;buf[o+4]=c[0];buf[o+5]=c[1];buf[o+6]=c[2];buf[o+7]=c[3];nv++}
+function quad(x0,y0,x1,y1,u0,v0,u1,v1,c){vtx(x0,y0,u0,v0,c);vtx(x1,y0,u1,v0,c);vtx(x1,y1,u1,v1,c);vtx(x0,y0,u0,v0,c);vtx(x1,y1,u1,v1,c);vtx(x0,y1,u0,v1,c)}
+function rquad(cx,cy,hx,hy,ax,ay,u0,v0,u1,v1,c){const bx=-ay,by=ax;const p=[[cx-ax*hx-bx*hy,cy-ay*hx-by*hy],[cx+ax*hx-bx*hy,cy+ay*hx-by*hy],[cx+ax*hx+bx*hy,cy+ay*hx+by*hy],[cx-ax*hx+bx*hy,cy-ay*hx+by*hy]];
+  vtx(p[0][0],p[0][1],u0,v0,c);vtx(p[1][0],p[1][1],u1,v0,c);vtx(p[2][0],p[2][1],u1,v1,c);vtx(p[0][0],p[0][1],u0,v0,c);vtx(p[2][0],p[2][1],u1,v1,c);vtx(p[3][0],p[3][1],u0,v1,c)}
+function flush(prog,set){if(!nv)return;const Q=P[prog];gl.useProgram(Q.p);gl.uniform2f(Q.u.uRes,W,H);if(set)set(Q.u);gl.bufferData(gl.ARRAY_BUFFER,buf.subarray(0,nv*8),gl.STREAM_DRAW);gl.drawArrays(gl.TRIANGLES,0,nv);nv=0}
+function fullscreen(prog,set){quad(0,0,W,H,0,0,1,1,[0,0,0,0]);flush(prog,set)}
+function tex(url,{premul=false,repeat=false}={}){return new Promise(res=>{const im=new Image();im.onload=()=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,premul);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,im);gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  const w=repeat?gl.REPEAT:gl.CLAMP_TO_EDGE;gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,w);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  const ext=gl.getExtension('EXT_texture_filter_anisotropic');if(ext)gl.texParameterf(gl.TEXTURE_2D,ext.TEXTURE_MAX_ANISOTROPY_EXT,8);res(t)};im.src=url})}
+// render targets
+const EM_SCALE=HDR?1:1/8;  // without float buffers, store emissive scaled down
+function rt(w,h){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  if(HDR)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);return{t,f,w,h}}
+let R=null;
+function resize(){DPR=window.devicePixelRatio||1;W=innerWidth;H=innerHeight;cv.width=Math.round(W*DPR);cv.height=Math.round(H*DPR);
+  const w=cv.width,h=cv.height;R={E:rt(w,h),A1:rt(w>>2,h>>2),B1:rt(w>>2,h>>2),A2:rt(w>>3,h>>3),B2:rt(w>>3,h>>3)}}
+addEventListener('resize',resize);
+function target(r){gl.bindFramebuffer(gl.FRAMEBUFFER,r?r.f:null);gl.viewport(0,0,r?r.w:cv.width,r?r.h:cv.height)}
+function bind(unit,t){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,t)}
+
+/* ---------------- particles ---------------- */
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const sparks=[],smokes=[],embers=[],SMOKE_LIFE=3.4;
+const strands=[{pts:[],acc:0,off:0.1,seed:1.3},{pts:[],acc:0.5,off:0.8,seed:7.9}];
+let emberAcc=0;
+function vh(i,j,k){const s=Math.sin(i*127.1+j*311.7+k*74.7)*43758.5453;return s-Math.floor(s)}
+function vnoise(x,y,z){const i=Math.floor(x),j=Math.floor(y),k=Math.floor(z),fx=x-i,fy=y-j,fz=z-k,u=fx*fx*(3-2*fx),v=fy*fy*(3-2*fy),w=fz*fz*(3-2*fz);
+  const L=(a,b,t)=>a+(b-a)*t;
+  return L(L(L(vh(i,j,k),vh(i+1,j,k),u),L(vh(i,j+1,k),vh(i+1,j+1,k),u),v),L(L(vh(i,j,k+1),vh(i+1,j,k+1),u),L(vh(i,j+1,k+1),vh(i+1,j+1,k+1),u),v),w)}
+let sparkAcc=0,smokeAcc=0,burstT=0,lastTip=null;
+function spawnSpark(x,y,th,o={}){
+  // mostly upward hemisphere, leaning back over the burnt side, a few downward
+  const a=o.a??(Math.random()<0.88?rnd(-Math.PI*0.95,-Math.PI*0.08):rnd(0.15,Math.PI-0.15));
+  const v=th*(o.v??Math.pow(Math.random(),0.7)*95+12);
+  const hot=Math.random()<0.14;                        // a few white-hot sparks, the rest orange
+  const b=Math.exp((Math.random()+Math.random()-1)*0.9); // log-normal brightness spread
+  sparks.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,age:0,life:o.life??rnd(0.15,0.75),T0:o.T0??(hot?rnd(0.88,1.0):rnd(0.42,0.72)),b,
+    w:rnd(0.5,1.0),split:o.child?0:(Math.random()<0.08?rnd(0.35,0.7):0),child:!!o.child,h:[[x,y]]})}
+function stepParticles(dt,g,tip,burning,time){
+  const th=g.th;
+  if(burning){
+    burstT-=dt;let rate=92+200*flash;if(burstT<0){burstT=rnd(0.1,0.6);rate*=rnd(1,2.2)}
+    sparkAcc+=rate*dt;while(sparkAcc>1){sparkAcc--;spawnSpark(tip+rnd(-0.3,0.2)*th,g.y+rnd(-0.35,0.25)*th,th)}
+    if(S.smoke)for(const st of strands){st.acc+=dt*40;while(st.acc>1){st.acc--;st.pts.push({x:tip-th*(0.2+st.off),y:g.y-th*0.45,vx:rnd(-0.6,0.2)*th,vy:-rnd(3.0,4.2)*th,age:0})}}
+    emberAcc+=dt*rnd(1,5);while(emberAcc>1){emberAcc--;embers.push({x:tip-th*rnd(0.4,2.4),y:g.y+th*rnd(-0.1,0.3),vx:rnd(-1,1)*th,vy:rnd(0,2)*th,age:0,life:rnd(0.5,1.3),T0:rnd(0.2,0.35),h:[]})}
+  }
+  const G=th*42,DRAG=2.6;
+  for(let i=sparks.length-1;i>=0;i--){const s=sparks[i];s.age+=dt;
+    if(s.split&&s.age>s.life*s.split){const n=3+Math.floor(Math.random()*4);for(let k=0;k<n;k++)spawnSpark(s.x,s.y,th,{child:true,a:rnd(0,Math.PI*2),v:rnd(10,40),life:rnd(0.08,0.26),T0:0.95});s.split=0;s.life=s.age+0.03}
+    if(s.age>s.life){sparks.splice(i,1);continue}
+    const k=Math.exp(-DRAG*dt);s.vx*=k;s.vy=s.vy*k+G*dt;s.x+=s.vx*dt;s.y+=s.vy*dt;s.h.push([s.x,s.y]);if(s.h.length>6)s.h.shift()}
+  for(const st of strands){for(let i=st.pts.length-1;i>=0;i--){const q=st.pts[i];q.age+=dt;if(q.age>SMOKE_LIFE){st.pts.splice(i,1);continue}
+      // curl of a slowly moving noise field: turbulence grows as the smoke rises and cools
+      const sc=th*7,tt=time*0.35+st.seed,e=0.5,n0=vnoise(q.x/sc,q.y/sc,tt),nx=vnoise(q.x/sc+e,q.y/sc,tt),ny=vnoise(q.x/sc,q.y/sc+e,tt);
+      const cx=(ny-n0)/e,cy=-(nx-n0)/e,amp=th*(3+16*Math.min(1,q.age/1.6));
+      q.vx+=(cx*amp-q.vx*0.6)*dt;q.vy+=(cy*amp*0.6-q.vy*0.25-th*0.6)*dt;q.x+=q.vx*dt;q.y+=q.vy*dt}}
+  for(let i=embers.length-1;i>=0;i--){const e=embers[i];e.age+=dt;if(e.age>e.life){embers.splice(i,1);continue}
+    e.vy+=th*30*dt;e.vx*=Math.exp(-1.5*dt);e.x+=e.vx*dt;e.y+=e.vy*dt;e.h.push([e.x,e.y]);if(e.h.length>4)e.h.shift()}
+}
+
+/* ---------------- audio: hiss + granular crackle + pops ---------------- */
+let AC=null,FZ=null,NB=null;
+function audio(){if(AC||!S.sound)return;try{AC=new AudioContext();const len=AC.sampleRate*2;NB=AC.createBuffer(1,len,AC.sampleRate);const d=NB.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+  const s=AC.createBufferSource();s.buffer=NB;s.loop=true;const hp=AC.createBiquadFilter();hp.type='highpass';hp.frequency.value=2200;const pk=AC.createBiquadFilter();pk.type='peaking';pk.frequency.value=6500;pk.gain.value=6;
+  FZ=AC.createGain();FZ.gain.value=0;s.connect(hp).connect(pk).connect(FZ).connect(AC.destination);s.start()}catch(e){}}
+function grain(f,dur,g,type='highpass'){if(!AC)return;const s=AC.createBufferSource();s.buffer=NB;const fl=AC.createBiquadFilter();fl.type=type;fl.frequency.value=f;fl.Q.value=0.9;
+  const ga=AC.createGain(),t=AC.currentTime+Math.random()*0.016;ga.gain.setValueAtTime(g,t);ga.gain.exponentialRampToValueAtTime(.0001,t+dur);s.connect(fl).connect(ga).connect(AC.destination);s.start(t,Math.random()*1.5);s.stop(t+dur+.02)}
+function soundTick(dt,burning,f){if(!AC)return;const on=burning&&S.sound&&S.vis;
+  FZ.gain.setTargetAtTime(on?(0.010+0.006*Math.random()+f*f*0.02):0,AC.currentTime,0.03);
+  if(!on)return;let n=(35+40*f)*dt;while(n>0){if(Math.random()<n)grain(3000+Math.random()*5000,0.003+Math.random()*0.01,0.05+Math.random()*0.18);n--}
+  if(Math.random()<(2+3*f)*dt)grain(700+Math.random()*900,0.025,0.25,'bandpass')}
+
+/* ---------------- frame ---------------- */
+let T=null,last=performance.now();const t0=performance.now();
+let manual=false,mtime=0;
+window.ropeRun=(n,dt=1/60)=>{manual=true;for(let i=0;i<n;i++){mtime+=dt;draw(mtime,dt)}return sparks.length};
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min(.05,(now-last)/1000);last=now;if(manual)return;draw((now-t0)/1000,dt)}
+function draw(time,dt){
+  if(!T||!R)return;
+  const g=geo(),th=g.th,f=frac(),burning=f<1&&S.vis,tip=g.x0+(g.x1-g.x0)*f;
+  stepParticles(dt,g,tip,burning,time);soundTick(dt,burning,f);
+  flash=Math.max(0,flash-dt*2.0);
+  const bodyH=M.body1-M.body0,qh=th*M.tileH/bodyH,tilePx=th*M.tileW/bodyH*2.0,vC=(M.body0+M.body1)/2/M.tileH,vH=(M.body1-M.body0)/2/M.tileH,top=g.y-vC*qh;
+  const rx0=Math.max(g.x0,tip-th*3.2);
+  const ropeU=(u,mode)=>{bind(0,T.a);bind(1,T.n);gl.uniform1i(u.uAlb,0);gl.uniform1i(u.uNrm,1);gl.uniform1f(u.uTip,tip);gl.uniform1f(u.uTh,th);gl.uniform1f(u.uTime,time);
+    gl.uniform1f(u.uMode,mode);gl.uniform1f(u.uBurn,burning?1:0);gl.uniform1f(u.uVC,vC);gl.uniform1f(u.uVH,vH);gl.uniform1f(u.uX0,g.x0);gl.uniform1f(u.uX1,g.x1)};
+  const ropeQuad=(dy,col)=>quad(rx0,top+dy,g.x1,top+qh+dy,(rx0-g.x0)/tilePx,0,(g.x1-g.x0)/tilePx,1,col);
+  // ---- base layer (alpha-blended) ----
+  target(null);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  if(tip>g.x0+th){quad(g.x0,g.y-th*0.9,tip,g.y+th*0.9,0,0,1,1,[0,0,0,1]);flush('ash',u=>{gl.uniform1f(u.uTip,tip);gl.uniform1f(u.uTh,th)})}
+  if(rx0<g.x1){ropeQuad(th*0.4,[0,0,0,1]);flush('rope',u=>ropeU(u,1));ropeQuad(0,[1,1,1,1]);flush('rope',u=>ropeU(u,0))}
+  for(const st of strands){const P=st.pts;for(let i=1;i<P.length;i++){const a=P[i-1],b=P[i],dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy);if(len<0.01)continue;
+      const age=(a.age+b.age)/2,k=age/SMOKE_LIFE,wd=th*(0.08+1.4*Math.pow(k,0.85)),al=0.17*Math.min(1,age*2.2)*Math.pow(1-k,1.6);
+      rquad((a.x+b.x)/2,(a.y+b.y)/2,len/2+wd*0.5,wd,dx/len,dy/len,0,-1,1,1,[Math.max(0,1-age*2.5),0,0,al])}}
+  flush('smoke',u=>{gl.uniform1f(u.uTime,time);gl.uniform1f(u.uTh,th)});
+  // ---- emissive layer (additive, HDR) ----
+  target(R.E);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);gl.blendFunc(gl.ONE,gl.ONE);
+  const es=EM_SCALE;
+  if(burning){
+    if(rx0<g.x1){ropeQuad(0,[1,1,1,1]);flush('rope',u=>ropeU(u,2))}
+    const I=(0.85+0.3*Math.random())*(1+flash*1.5)*es,c=th*5;
+    quad(tip-c,g.y-c,tip+c,g.y+c,-1,-1,1,1,[0,0,0,0]);flush('core',u=>{gl.uniform1f(u.uTime,time);gl.uniform1f(u.uI,I)});
+  }
+  const SH=1/28; // shutter for motion blur
+  const segs=(s,I,col,hw)=>{const h=s.h,n=h.length;for(let j=n-1;j>0;j--){const a=h[j-1],b=h[j],dx=b[0]-a[0],dy=b[1]-a[1],len=Math.hypot(dx,dy)||0.01,f=Math.pow(j/(n-1),1.6);
+      rquad((a[0]+b[0])/2,(a[1]+b[1])/2,len/2+hw*0.6,hw*(0.6+0.4*f),dx/len,dy/len,0,-1,1,1,[col[0]*I*f,col[1]*I*f,col[2]*I*f,1])}};
+  const bbc=t=>[1,Math.pow(Math.min(1,Math.max(0,(t-0.08)*1.35)),1.25)*0.92,Math.pow(Math.min(1,Math.max(0,(t-0.5)*2)),1.4)*0.82];
+  for(const s of sparks){if(s.h.length<2)continue;const k=s.age/s.life,T_=s.T0*Math.exp(-1.8*k),sput=0.55+0.9*Math.random();
+    segs(s,(1.5+20*T_*T_*T_)*s.b*sput*(1-k*k)*es,bbc(T_),Math.max(0.55,s.w*th*0.05)*1.3)}
+  for(const e of embers){if(e.h.length<2)continue;const k=e.age/e.life;segs(e,(1.2+1.5*Math.random())*(1-k)*es,bbc(e.T0*(1-0.5*k)),Math.max(0.7,th*0.07))}
+  flush('spark');
+  if(false)for(const s of sparks){const k=s.age/s.life,T_=s.T0*Math.exp(-2.2*k)*(s.child?0.9:1),I=(2.5+22*T_*T_*T_)*(1-k*k)*es;
+    const bt=Math.min(1,Math.max(0,T_)),col=[1,Math.pow(Math.min(1,Math.max(0,(bt-0.08)*1.35)),1.25)*0.92,Math.pow(Math.min(1,Math.max(0,(bt-0.5)*2)),1.4)*0.82];
+    const ex=s.x-s.vx*SH,ey=s.y-s.vy*SH,dx=s.x-ex,dy=s.y-ey,len=Math.hypot(dx,dy)||1,ax=dx/len,ay=dy/len,hw=Math.max(0.75,s.w*th*0.075)*1.6;
+    rquad((s.x+ex)/2,(s.y+ey)/2,len/2+hw,hw,ax,ay,0,-1,1,1,[col[0]*I,col[1]*I,col[2]*I,1])}
+  flush('spark');
+  // ---- bloom ----
+  gl.disable(gl.BLEND);
+  const blurPass=(src,dst,dx,dy,res)=>{target(dst);fullscreen('blur',u=>{bind(0,src.t);gl.uniform1i(u.uT,0);gl.uniform2f(u.uTR,dst.w,dst.h);gl.uniform2f(u.uDir,dx/res.w,dy/res.h)})};
+  target(R.A1);fullscreen('blit',u=>{bind(0,R.E.t);gl.uniform1i(u.uT,0);gl.uniform2f(u.uTR,R.A1.w,R.A1.h)});
+  blurPass(R.A1,R.B1,1,0,R.A1);blurPass(R.B1,R.A1,0,1,R.A1);
+  target(R.A2);fullscreen('blit',u=>{bind(0,R.A1.t);gl.uniform1i(u.uT,0);gl.uniform2f(u.uTR,R.A2.w,R.A2.h)});
+  blurPass(R.A2,R.B2,1,0,R.A2);blurPass(R.B2,R.A2,0,1,R.A2);blurPass(R.A2,R.B2,2,0,R.A2);blurPass(R.B2,R.A2,0,2,R.A2);
+  // ---- composite emissive onto the screen ----
+  target(null);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  fullscreen('comp',u=>{bind(0,R.E.t);bind(1,R.A1.t);bind(2,R.A2.t);gl.uniform1i(u.uE,0);gl.uniform1i(u.uB1,1);gl.uniform1i(u.uB2,2);gl.uniform2f(u.uTR,cv.width,cv.height);gl.uniform1f(u.uScale,1/es)});
+}
+Promise.all([tex(ROPE_TEX.albedo,{premul:true,repeat:true}),tex(ROPE_TEX.normal,{repeat:true})]).then(([a,n])=>{T={a,n};post({type:'ready'})});
+addEventListener('pointerdown',()=>{audio();if(AC&&AC.state==='suspended')AC.resume()});
+setInterval(()=>{if(AC&&AC.state==='suspended')AC.resume().catch(()=>{})},1500);
+resize();requestAnimationFrame(frame);
+/* web: the rope burns while nobody touches anything */
+const IDLE=(Number(new URLSearchParams(location.search).get('t'))||5)*1000;
+let lastInput=performance.now(),showing=false;
+const poke=()=>{lastInput=performance.now();if(showing){showing=false;ropeHide()}};
+for(const ev of['pointermove','pointerdown','keydown','wheel','touchstart','touchmove','scroll'])addEventListener(ev,poke,{passive:true});
+setInterval(()=>{if(!showing&&T&&performance.now()-lastInput>=IDLE){showing=true;ropeShow()}},100);
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+mac/build/
+mac/*.app
+*.zip
+.DS_Store
