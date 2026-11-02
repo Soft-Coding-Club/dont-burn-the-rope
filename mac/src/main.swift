@@ -1,4 +1,4 @@
-// 밧줄을 태우지 마라 (Don't Burn the Rope): when you stop touching the mouse and keyboard, a rope starts burning across the screen.
+// 밧줄 태우지 마라 (Don't Burn the Rope): when you stop touching the mouse and keyboard, a rope starts burning across the screen.
 // Touch anything and it disappears. Transparent, click-through, no calibration.
 import Cocoa
 import WebKit
@@ -59,7 +59,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
         win.orderFrontRegardless()   // stays on screen but fully transparent until idle
 
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        status.button?.image = NSImage(systemSymbolName: "flame", accessibilityDescription: "밧줄을 태우지 마라")
+        status.button?.image = NSImage(systemSymbolName: "flame", accessibilityDescription: "밧줄 태우지 마라")
         status.button?.image?.isTemplate = true
         rebuildMenu()
 
@@ -88,7 +88,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
 
     func rebuildMenu() {
         let m = NSMenu()
-        let head = NSMenuItem(title: "밧줄을 태우지 마라", action: nil, keyEquivalent: ""); head.isEnabled = false; m.addItem(head)
+        let head = NSMenuItem(title: "밧줄 태우지 마라", action: nil, keyEquivalent: ""); head.isEnabled = false; m.addItem(head)
         m.addItem(.separator())
         for s in [3.0, 10, 30, 60, 300] {
             let t = s < 60 ? "\(Int(s))초 뒤" : "\(Int(s / 60))분 뒤"
