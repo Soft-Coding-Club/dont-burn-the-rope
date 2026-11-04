@@ -9,6 +9,7 @@ swiftc -O -swift-version 5 -target arm64-apple-macos13 -o build/RopeIdle src/mai
 cp build/RopeIdle "$APP/Contents/MacOS/RopeIdle"
 cp src/rope.html "$APP/Contents/Resources/"
 cp src/assets/textures.js "$APP/Contents/Resources/assets/"
+cp src/assets/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -18,8 +19,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>ai.multi-turn.dont-burn-the-rope</string>
   <key>CFBundleExecutable</key><string>RopeIdle</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleShortVersionString</key><string>1.0.1</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
